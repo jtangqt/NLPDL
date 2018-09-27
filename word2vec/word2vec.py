@@ -6,6 +6,7 @@ from nltk import sent_tokenize
 import time
 import numpy as np
 import pandas as pd
+import math
 
 def word_to_dict_longer(input_folder, output_dict):
 
@@ -61,10 +62,37 @@ def word_to_dict(input_folder, output_file):
 	os.chdir("../")
 
 	with open(output_file, 'w+') as handle:
-		entire_corpus = " ".join(corpus)
+		entire_corpus = " ".join(corpus).lower()
 		handle.write(entire_corpus)
 
-	return " ".join(corpus)
+class vocab:
+	def __init__(self, word):
+		self.word = word
+		self.count = 0
+	def add_count(self):
+		self.count += 1
+
+class TableForNegativeSamples:
+	def __init__(self, vocab, index_to_word, vocab_dict):
+		power = 0.75
+		norm = sum([math.pow(vocab_dict[index_to_word[t]].count, power) for t in vocab]) # Normalizing constants
+
+		table_size = 10000000
+		table = np.zeros(table_size, dtype=np.uint32)
+
+		p = 0 # Cumulative probability
+		i = 0
+		for j, word in enumerate(vocab):
+			p += float(math.pow(float(vocab_dict[index_to_word[word]].count), power))/norm
+			while i < table_size and float(i) / table_size < p:
+				table[i] = j
+				i += 1
+		self.table = table
+
+	def sample(self, count, length):
+		# create all of the random vectors
+		indices = np.random.randint(low=0, high=len(self.table), size=(length, count))
+		return [self.table[i] for i in indices]
 
 
 class word2vec(): 
@@ -76,98 +104,226 @@ class word2vec():
 		self.n = settings['n']
 
 	def generate_data(self, settings, corpus): 
-		## open up word dictionary 
-			
-		## cycle through each sentence in the corpus 
-			## create one hot word vectors for each word in a sentence
-			## create one hot word vectors for the context words
-		
 		i = 0
 		index_to_word = {}
 		word_to_index = {}
 		training_data = []
+		vocab_dict = {}
+		tmp_vocab_dict = [None for x in range(len(corpus))]
 
 		## creates the word to index dictionary and vice versa 
 		for word in word_tokenize(corpus):
-			if word in word_to_index: 
-				continue
+			if word in vocab_dict: 
+				vocab_dict[word].add_count()
 			else: 
+				tmp_vocab_dict[i] = vocab(word) 
+				vocab_dict[word] = tmp_vocab_dict[i]
 				word_to_index[word] = i
 				index_to_word[i] = word
 				i += 1
 
+		self.vocab_dict = vocab_dict
 		self.word_to_index = word_to_index
 		self.index_to_word = index_to_word
 		self.no_words = len(index_to_word)
 
-		self.in_vec = np.random.uniform(-0.9, 0.9, (self.no_words, self.n))
-		self.out_vec = np.random.uniform(-0.9, 0.9, (self.n, self.no_words))
+		self.in_vec = np.random.uniform(-0.9/100, 0.9/100, (self.no_words, self.n))
+		self.out_vec = np.random.uniform(-0.9/100, 0.9/100, (self.no_words, self.n))
 
-		sentences = sent_tokenize(corpus)
-		print(len(sentences))
-		return sentences
-			
 	def word_one_hot(self, word): 
 		vec = [0 for i in range(0, self.no_words)]
 		tmp = self.word_to_index[word]
 		vec[tmp] = 1
 		return vec 
 
+	def softmax(self, x):
+		num = np.exp(x)
+		return num / num.sum(axis = 0)
+
 	def forward_prop(self, x):
-		h = np.dot(self.in_vec.T, x)
-		u = np.dot(self.out_vec.T, h)
-		y = self.softmax(u)
-		return y, u, h
+		v_c = np.dot(self.in_vec, x)
+		u_v = np.dot(self.out_vec.T, v_c)
+		y = self.softmax(u_v)
+		return y, u_v, v_c
 
-	def train_data(sentences): 
+	def sigmoid(self, x):
+		return 1 / (np.exp(-x) + 1)
 
-		k = 0
+	def train_data(self, corpus): 
+
+		epoch = 0
 		w_context = []
 		w_target = []
-		## cycle through each sentence in the corpus
-		for ind_sentence in sentences: 
-			sentence = word_tokenize(ind_sentence)
-			len_sentence = len(sentence)
+		
+		# Initialize variables 
+		len_tokens = len(word_tokenize(corpus))
+		tokens = [word[1] for word in self.word_to_index.items()]
+		sentences = sent_tokenize(corpus)
+		table = TableForNegativeSamples(tokens, self.index_to_word, self.vocab_dict)
+
+		while epoch < self.epochs: 
 			
-			for i, word in enumerate(sentence):
+			neg_sampling = table.sample(settings['k'], len_tokens * (2*self.window_size+1))
+			word_count = 0
+			loss = 0
 
-				# create one hot word vector for each word in a sentence 
-				w_target = self.word_one_hot(word)
+			# Loop through each sentence
+			for ind_sentence in sentences: 
+				sentence = word_tokenize(ind_sentence) # [:-1]
+				len_sentence = len(sentence)
+				
+				# Loop through each word in the sentence as target
+				for i, word in enumerate(sentence):
+					k = 0
 
-				#create one hot word vectors for the context words
-				w_context = []
-				for j in range(i - self.window_size, i + self.window_size + 1): 
-					if j != i and j < len_sentence and j >= 0:
-						w_context.append(self.word_one_hot(sentence[j]))
+					# Loop through each context word for the target 
+					for j in range(i - self.window_size, i + self.window_size + 1): 
+						if j != i and j < len_sentence and j >= 0:
+							context = sentence[j]
+							classifiers = [(self.word_to_index[word], 1)] + [(target, 0) for target in neg_sampling[word_count * self.window_size + k]]
+							neu1e = np.zeros(self.n)
+							q_i = 0
 
-				## forward propagation 
-				y, u, h = self.forward_prop(w_target)
+							for target, label in classifiers:
+								nn0 = self.in_vec[self.word_to_index[context]]
+								nn1 = self.out_vec[target]
+								z = np.dot(nn0, nn1)
+								p = self.sigmoid(z)
+								g = self.learning_rate * (label - p)
 
-				## calculate error
+								if label == 1:
+									p_i = p
+								else:
+									q_i += np.log(1-p)
 
-				## back propagation
+								neu1e += g * nn1 
+								self.out_vec[target] += g * nn0
 
+							self.in_vec[self.word_to_index[context]] += neu1e
+							loss += -np.log(p_i) - q_i
 
-		return 0
+							k += 1
+					word_count += 1
+			print("finished {0} epoch, loss: {1}".format(epoch, loss))
+			epoch += 1
 
+		pass
+
+    # input word, returns top [n] most similar words
+	def word_sim(self, word, top_n):
+		w1_index = self.word_to_index[word]
+		v_w1 = self.in_vec[w1_index]
+
+		# CYCLE THROUGH VOCAB
+		word_sim = {}
+		for i in range(self.no_words):
+			v_w2 = self.out_vec[i]
+			theta_num = np.dot(v_w1, v_w2)
+			theta_den = np.linalg.norm(v_w1) * np.linalg.norm(v_w2)
+			theta = theta_num / theta_den
+
+			tmp_word = self.index_to_word[i]
+			word_sim[tmp_word] = theta
+
+		words_sorted = sorted(word_sim.items(), key=lambda word : word[1], reverse=True)
+
+		i = 0
+		for item, sim in words_sorted:
+			print(item, sim)
+			i += 1
+			if i > top_n:
+				break
+
+		pass
+
+	def word_vec(self, word):
+		w_index = self.word_to_index[word]
+		v_w = self.in_vec[w_index]
+		return v_w
+
+	def vec_word(self, vec, k):
+		word_sim = {}
+		for i in range(self.no_words):
+			v_w2 = self.in_vec[i]
+			theta_num = np.dot(vec, v_w2)
+			theta_den = np.linalg.norm(vec) * np.linalg.norm(v_w2)
+			theta = theta_num/theta_den
+			word = self.index_to_word[i]
+			word_sim[word] = theta
+
+		words_sorted = sorted(word_sim.items(), key=lambda word : word[1], reverse=True)
+
+		return words_sorted[:k]
+
+	def word_dist(self, word_a, word_b):
+		a = self.in_vec[self.word_to_index[word_a]]
+		b = self.in_vec[self.word_to_index[word_b]]
+		num = np.dot(a,b)
+		denom = np.linalg.norm(a) * np.linalg.norm(b)
+		return num/denom
+
+	def analogies(self, word_a, word_b, word_d, top_n):
+		a = self.in_vec[self.word_to_index[word_a]]
+		b = self.in_vec[self.word_to_index[word_b]]
+		d = self.in_vec[self.word_to_index[word_d]]
+		c = a - b + d 
+
+		i = 0
+		for item, sim in self.vec_word(c, top_n):
+			if item == ".": 
+				continue
+			print(item, sim)
+			i += 1
+			if i > top_n:
+				break
+
+		return self.vec_word(c, top_n) #return word c
+
+def save(w2v, output_pkl):
+	with open(output_pkl, 'wb') as handle:
+		pickle.dump(w2v, handle, protocol = pickle.HIGHEST_PROTOCOL)
 
 if __name__ == "__main__":
 	input_file = "TC_provided"
-	output_file = "corpus.txt"
-	#corpus = word_to_dict(input_file, output_file)
+	output_file = "corpus1.txt"
+	# corpus = word_to_dict(input_file, output_file)
 
 	settings = {}
 
-	settings['learning_rate'] = 1
-	settings['i'] = 5 #epochs
-	settings['w'] = 2 #window size
-	settings['k'] = 10 #negative sampling
-	settings['n'] = 5 #dimensionality of word embedding 
+	settings['learning_rate'] = 0.05
+	settings['i'] = 20 #epochs
+	settings['w'] = 3 #window size
+	settings['k'] = 2 #negative sampling
+	settings['n'] = 7 #dimensionality of word embedding 
 
-	with open(output_file, "r") as handle:
-		corpus = handle.read()
-	w2v = word2vec()
-	token_corpus = w2v.generate_data(settings, corpus)
-	w2v.train_data(token_corpus)
-	print("hi")
-	print(hehe)
+	# with open(output_file, "r") as handle:
+	# 	corpus = handle.read()
+
+	# # corpus = "the quick brown fox jumped over the lazy dog."
+	# w2v = word2vec()
+	# w2v.generate_data(settings, corpus)
+	# w2v.train_data(corpus)
+	# save(w2v, "0.05-7-2.pkl")
+
+	with open("0.05-5-2.pkl", "rb") as handle:
+		w2v = pickle.load(handle)
+
+	word = "dog"
+	print(word)
+	w2v.word_sim(word, 30)
+
+	# a = "sky"
+	# b = "blue"
+	# d = "red"
+	# print(a, b, d)
+	# w2v.analogies(a, b, d, 40)
+
+	# a_1 = "pasta"
+	# a_2 = "car"
+	# print("{0}, {1}".format(a_1, a_2))
+	# print(w2v.word_dist(a_1, a_2))
+
+	# b_1 = "rainbow"
+	# b_2 = "see"
+	# print("{0}, {1}".format(b_1, b_2))
+	# print(w2v.word_dist(b_1, b_2))
